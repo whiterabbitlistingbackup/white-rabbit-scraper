@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import time
@@ -17,18 +17,12 @@ def is_valid_url(url):
     except Exception:
         return False
 
-# --- Scraper function using requests + BeautifulSoup ---
+# --- Scraper function using cloudscraper ---
 def scrape_images(urls):
     results = []
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
+    # Create cloudscraper instance (bypasses Cloudflare)
+    scraper = cloudscraper.create_scraper()
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -39,13 +33,13 @@ def scrape_images(urls):
         status_text.text(f"Scraping {idx + 1}/{len(urls)}: {url}")
         
         try:
-            # Add small delay between requests
-            time.sleep(1)
+            # Reduce delay - only every 20 requests
+            if idx > 0 and idx % 20 == 0:
+                time.sleep(0.5)
             
-            response = requests.get(
+            response = scraper.get(
                 url, 
-                headers=headers, 
-                timeout=15,
+                timeout=10,
                 allow_redirects=True
             )
             response.raise_for_status()
@@ -72,7 +66,7 @@ def scrape_images(urls):
             for script in soup.find_all('script'):
                 if script.string and 'ebayimg' in script.string:
                     import re
-                    urls_found = re.findall(r'https://[^\s"<>]+(?:jpg|jpeg|png|gif)', script.string)
+                    urls_found = re.findall(r'https://[^\s"<>]+\.(?:jpg|jpeg|png|gif)', script.string)
                     img_urls.update(urls_found)
             
             img_list = list(img_urls)
@@ -84,36 +78,20 @@ def scrape_images(urls):
                 "Status": "✅ Success" if img_list else "⚠️ No images"
             })
             
-        except requests.HTTPError as e:
-            if e.response.status_code == 403:
-                results.append({
-                    "Listing URL": url,
-                    "Image Count": 0,
-                    "Images": "",
-                    "Status": "❌ 403 Forbidden - eBay blocked request"
-                })
-            else:
-                results.append({
-                    "Listing URL": url,
-                    "Image Count": 0,
-                    "Images": "",
-                    "Status": f"❌ HTTP {e.response.status_code}"
-                })
-            
-        except requests.Timeout:
-            results.append({
-                "Listing URL": url,
-                "Image Count": 0,
-                "Images": "",
-                "Status": "⏱️ Timeout"
-            })
-            
         except Exception as e:
+            error_msg = str(e)
+            if '403' in error_msg or 'Forbidden' in error_msg:
+                status = "❌ 403 Blocked"
+            elif 'Timeout' in error_msg or 'timeout' in error_msg:
+                status = "⏱️ Timeout"
+            else:
+                status = f"❌ {error_msg[:40]}"
+            
             results.append({
                 "Listing URL": url,
                 "Image Count": 0,
                 "Images": "",
-                "Status": f"❌ {str(e)[:40]}"
+                "Status": status
             })
     
     return results
