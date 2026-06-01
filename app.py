@@ -1,17 +1,12 @@
 import streamlit as st
 import pandas as pd
-import subprocess
-from playwright.sync_api import sync_playwright
+import requests
+from bs4 import BeautifulSoup
+import io
+import zipfile
 from urllib.parse import urlparse
 
-# --- Install Playwright browser on Streamlit Cloud (cached) ---
-@st.cache_resource
-def install_playwright_browsers():
-    subprocess.run(["playwright", "install", "chromium"], check=False)
-
-install_playwright_browsers()
-
-st.title("🐇 White Rabbit Scraper — Playwright Edition")
+st.title("🐇 White Rabbit Scraper")
 st.write("Paste your eBay listing URLs below. One per line.")
 
 # --- URL Validation ---
@@ -23,72 +18,63 @@ def is_valid_url(url):
     except Exception:
         return False
 
-# --- Scraper function using Playwright ---
+# --- Scraper function using requests + BeautifulSoup ---
 def scrape_images(urls):
     results = []
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, url in enumerate(urls):
+        progress = (idx + 1) / len(urls)
+        progress_bar.progress(progress)
+        status_text.text(f"Scraping {idx + 1}/{len(urls)}: {url}")
         
-        # Create progress bar
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for idx, url in enumerate(urls):
-            # Update progress
-            progress = (idx + 1) / len(urls)
-            progress_bar.progress(progress)
-            status_text.text(f"Scraping {idx + 1}/{len(urls)}: {url}")
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
             
-            try:
-                page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                
-                # Grab ALL images on the page
-                imgs = page.query_selector_all("img")
-                img_urls = []
-                
-                for img in imgs:
-                    src = img.get_attribute("src")
-                    if src and "s-l" in src:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find all images
+            img_tags = soup.find_all('img')
+            img_urls = []
+            
+            for img in img_tags:
+                src = img.get('src') or img.get('data-src')
+                if src:
+                    # Convert relative URLs to absolute
+                    if src.startswith('/'):
+                        src = 'https://ebay.com' + src
+                    if src.startswith('http'):
                         img_urls.append(src)
-                
-                results.append({
-                    "Listing URL": url,
-                    "Image Count": len(img_urls),
-                    "Images": img_urls,
-                    "Status": "✅ Success"
-                })
-                
-            except TimeoutError:
-                results.append({
-                    "Listing URL": url,
-                    "Image Count": 0,
-                    "Images": [],
-                    "Status": "⏱️ Timeout",
-                    "Error": "Page load timeout"
-                })
-                
-            except Exception as e:
-                error_msg = str(e)
-                if "crashed" in error_msg.lower():
-                    status = "❌ Browser crashed (page too heavy)"
-                elif "net::ERR_NAME_NOT_RESOLVED" in error_msg:
-                    status = "❌ Invalid domain"
-                elif "net::ERR_CONNECTION" in error_msg:
-                    status = "❌ Connection failed"
-                else:
-                    status = "❌ Error"
-                
-                results.append({
-                    "Listing URL": url,
-                    "Image Count": 0,
-                    "Images": [],
-                    "Status": status,
-                    "Error": error_msg[:100]
-                })
-        
-        browser.close()
+            
+            results.append({
+                "Listing URL": url,
+                "Image Count": len(img_urls),
+                "Images": "\n".join(img_urls) if img_urls else "No images found",
+                "Status": "✅ Success" if img_urls else "⚠️ No images found"
+            })
+            
+        except requests.Timeout:
+            results.append({
+                "Listing URL": url,
+                "Image Count": 0,
+                "Images": "",
+                "Status": "⏱️ Timeout"
+            })
+            
+        except Exception as e:
+            results.append({
+                "Listing URL": url,
+                "Image Count": 0,
+                "Images": "",
+                "Status": f"❌ Error: {str(e)[:50]}"
+            })
     
     return results
 
@@ -128,14 +114,14 @@ if st.button("Start Scraping", type="primary"):
                 successful = len(df[df["Status"].str.contains("Success", na=False)])
                 st.metric("Successful", successful)
             with col3:
-                total_images = df["Image Count"].sum()
+                total_images = df[df["Status"].str.contains("Success", na=False)]["Image Count"].sum()
                 st.metric("Total Images", int(total_images))
             
-            # Download options
+            # Download as CSV
             csv = df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 label="📥 Download CSV",
                 data=csv,
-                file_name="results.csv",
+                file_name="ebay_images.csv",
                 mime="text/csv"
             )
