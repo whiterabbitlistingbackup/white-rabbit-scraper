@@ -14,8 +14,17 @@ def scrape_images(urls):
     results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer"
+        ]
+    )
+    page = browser.new_page()
 
         for url in urls:
             st.write(f"Scraping: {url}")
