@@ -1,145 +1,224 @@
 import streamlit as st
 import pandas as pd
-import cloudscraper
+import requests
+import re
+import os
+import io
+import zipfile
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-import time
 
-st.title("🐇 White Rabbit Scraper")
-st.write("Paste your eBay listing URLs below. One per line.")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "Referer": "https://www.ebay.co.uk/",
+    "Cookie": "ebay=%5Esbf%3D%23000000%5E"
+}
 
-# --- URL Validation ---
-def is_valid_url(url):
-    """Validate URL format"""
-    try:
-        result = urlparse(url)
-        return all([result.scheme in ['http', 'https'], result.netloc])
-    except Exception:
-        return False
+st.title("🐇 White Rabbit eBay Scraper")
+st.write("Extract full eBay listings with images, condition, price, and more.")
 
-# --- Scraper function using cloudscraper ---
-def scrape_images(urls):
-    results = []
+# --- Helpers ---
+def clean_title(title):
+    title = title.strip()
+    title = re.sub(r"[^A-Za-z0-9]+", "_", title)
+    return title[:60] or "item"
+
+def extract_title(soup):
+    tag = soup.find("h1")
+    if not tag:
+        return "item"
+    return clean_title(tag.get_text())
+
+def extract_condition(soup):
+    tag = soup.select_one(".x-item-condition-text")
+    if tag:
+        text = tag.get_text(" ", strip=True)
+        text = text.replace("More information - About this item condition", "")
+        text = " ".join(dict.fromkeys(text.split()))
+        return text.strip()
     
-    # Create cloudscraper instance (bypasses Cloudflare)
-    scraper = cloudscraper.create_scraper()
+    tag = soup.find(id="vi-itm-cond")
+    if tag:
+        text = tag.get_text(strip=True)
+        text = " ".join(dict.fromkeys(text.split()))
+        return text
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    return "UnknownCondition"
+
+def extract_price(soup):
+    selectors = [
+        ".x-price-primary",
+        "#prcIsum",
+        "#mm-saleDscPrc",
+        "#prcIsum_bidPrice",
+        ".notranslate"
+    ]
+    for sel in selectors:
+        tag = soup.select_one(sel)
+        if tag:
+            return tag.get_text(strip=True)
+    return "UnknownPrice"
+
+def extract_category(soup):
+    crumbs = soup.select("li.seo-breadcrumb-text")
+    if crumbs:
+        return " > ".join([c.get_text(strip=True) for c in crumbs])
     
-    for idx, url in enumerate(urls):
-        progress = (idx + 1) / len(urls)
-        progress_bar.progress(progress)
-        status_text.text(f"Scraping {idx + 1}/{len(urls)}: {url}")
-        
+    crumbs = soup.select("nav[aria-label='Breadcrumb'] li a")
+    if crumbs:
+        return " > ".join([c.get_text(strip=True) for c in crumbs])
+    
+    scripts = soup.find_all("script")
+    category_candidates = []
+    
+    for s in scripts:
+        if not s.string:
+            continue
+        text = s.string
+        matches = re.findall(r'"categoryName":"([^"]+)"', text)
+        for m in matches:
+            category_candidates.append(m)
+    
+    category_candidates = list(dict.fromkeys(category_candidates))
+    if category_candidates:
+        return category_candidates[0]
+    
+    return "UnknownCategory"
+
+def extract_description(soup, html):
+    iframe = soup.find("iframe", {"id": "desc_ifr"})
+    if iframe and iframe.get("src"):
+        iframe_url = iframe["src"]
+        if iframe_url.startswith("//"):
+            iframe_url = "https:" + iframe_url
         try:
-            # Reduce delay - only every 20 requests
-            if idx > 0 and idx % 20 == 0:
-                time.sleep(0.5)
-            
-            response = scraper.get(
-                url, 
-                timeout=10,
-                allow_redirects=True
-            )
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # eBay stores images in multiple ways
-            img_urls = set()
-            
-            # Method 1: Direct img tags
-            for img in soup.find_all('img'):
-                src = img.get('src') or img.get('data-src')
-                if src and ('ebayimg' in src or 's-l' in src or 'picsum' in src):
-                    img_urls.add(src)
-            
-            # Method 2: Picture tags with sources
-            for picture in soup.find_all('picture'):
-                for source in picture.find_all('source'):
-                    src = source.get('srcset')
-                    if src:
-                        img_urls.add(src.split()[0])
-            
-            # Method 3: Look for image URLs in script/JSON
-            for script in soup.find_all('script'):
-                if script.string and 'ebayimg' in script.string:
-                    import re
-                    urls_found = re.findall(r'https://[^\s"<>]+\.(?:jpg|jpeg|png|gif)', script.string)
-                    img_urls.update(urls_found)
-            
-            img_list = list(img_urls)
-            
-            results.append({
-                "Listing URL": url,
-                "Image Count": len(img_list),
-                "Images": "\n".join(img_list) if img_list else "No images found",
-                "Status": "✅ Success" if img_list else "⚠️ No images"
-            })
-            
-        except Exception as e:
-            error_msg = str(e)
-            if '403' in error_msg or 'Forbidden' in error_msg:
-                status = "❌ 403 Blocked"
-            elif 'Timeout' in error_msg or 'timeout' in error_msg:
-                status = "⏱️ Timeout"
-            else:
-                status = f"❌ {error_msg[:40]}"
-            
-            results.append({
-                "Listing URL": url,
-                "Image Count": 0,
-                "Images": "",
-                "Status": status
-            })
+            r = requests.get(iframe_url, headers=HEADERS, timeout=10)
+            iframe_soup = BeautifulSoup(r.text, "html.parser")
+            text = iframe_soup.get_text("\n", strip=True)
+            if text:
+                return text
+        except:
+            pass
     
-    return results
+    for pid in ["desc_div", "viTabs_0_is"]:
+        tag = soup.find(id=pid)
+        if tag:
+            return tag.get_text("\n", strip=True)
+    
+    return "No seller description found."
 
-# --- UI Input ---
-input_text = st.text_area("Enter URLs here (one per line):")
+def extract_gallery_images(soup):
+    urls = set()
+    thumbs = soup.select("div.ux-image-carousel-item img")
+    
+    for img in thumbs:
+        for attr in ["src", "data-src", "data-img"]:
+            src = img.get(attr)
+            if src and "i.ebayimg.com" in src:
+                urls.add(src)
+        
+        srcset = img.get("srcset")
+        if srcset:
+            for part in srcset.split(","):
+                url = part.strip().split(" ")[0]
+                if "i.ebayimg.com" in url:
+                    urls.add(url)
+    
+    return urls
 
-if st.button("Start Scraping", type="primary"):
-    urls = [u.strip() for u in input_text.split("\n") if u.strip()]
+def extract_gallery_json(html):
+    urls = set()
+    matches = re.findall(r'\"iUrl\":\"(https:\\/\\/i\\.ebayimg\\.com[^\"]+)', html)
+    for m in matches:
+        urls.add(m.replace("\\/", "/"))
+    return urls
+
+def normalise_image(url):
+    return re.sub(r's-l\d+\.jpg', 's-l1600.jpg', url)
+
+# --- Main scrape function ---
+def scrape_listing(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        return None, str(e)
+    
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
+    
+    title = extract_title(soup)
+    condition = extract_condition(soup)
+    price = extract_price(soup)
+    category = extract_category(soup)
+    description = extract_description(soup, html)
+    
+    # Images
+    img_urls = extract_gallery_images(soup)
+    if not img_urls:
+        img_urls = extract_gallery_json(html)
+    
+    img_urls = [normalise_image(u) for u in img_urls]
+    img_urls = [u for u in img_urls if u.lower().endswith("s-l1600.jpg")]
+    img_urls = list(dict.fromkeys(img_urls))
+    
+    return {
+        "title": title,
+        "condition": condition,
+        "price": price,
+        "category": category,
+        "description": description,
+        "images": img_urls,
+        "image_count": len(img_urls)
+    }, None
+
+# --- UI ---
+input_text = st.text_area("Paste eBay URLs (one per line):", height=150)
+
+if st.button("🔍 Scrape Listings", type="primary"):
+    urls = [u.strip() for u in input_text.split("\n") if u.strip().startswith("http")]
     
     if not urls:
-        st.error("❌ No URLs provided.")
+        st.error("No valid URLs provided")
     else:
-        # Validate URLs
-        invalid_urls = [u for u in urls if not is_valid_url(u)]
-        valid_urls = [u for u in urls if is_valid_url(u)]
+        progress_bar = st.progress(0)
+        status = st.empty()
         
-        if invalid_urls:
-            st.warning(f"⚠️ {len(invalid_urls)} invalid URL(s) found and skipped:")
-            for url in invalid_urls:
-                st.text(f"  • {url}")
+        results = []
+        for idx, url in enumerate(urls):
+            progress_bar.progress((idx + 1) / len(urls))
+            status.text(f"Scraping {idx + 1}/{len(urls)}...")
+            
+            data, error = scrape_listing(url)
+            if error:
+                results.append({
+                    "URL": url,
+                    "Status": f"❌ {error}",
+                    "Title": "",
+                    "Condition": "",
+                    "Price": "",
+                    "Images": 0
+                })
+            else:
+                results.append({
+                    "URL": url,
+                    "Status": "✅ Success",
+                    "Title": data["title"],
+                    "Condition": data["condition"],
+                    "Price": data["price"],
+                    "Images": data["image_count"]
+                })
         
-        if valid_urls:
-            st.info(f"🔄 Scraping {len(valid_urls)} URL(s)… please wait.")
-            data = scrape_images(valid_urls)
-            
-            df = pd.DataFrame(data)
-            st.success("✅ Scraping complete!")
-            
-            # Display results
-            st.dataframe(df, use_container_width=True)
-            
-            # Summary stats
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total URLs", len(df))
-            with col2:
-                successful = len(df[df["Status"].str.contains("Success", na=False)])
-                st.metric("Successful", successful)
-            with col3:
-                total_images = df[df["Status"].str.contains("Success", na=False)]["Image Count"].sum()
-                st.metric("Total Images", int(total_images))
-            
-            # Download as CSV
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv,
-                file_name="ebay_images.csv",
-                mime="text/csv"
-            )
+        df = pd.DataFrame(results)
+        st.success(f"✅ Scraped {len(urls)} listings!")
+        st.dataframe(df, use_container_width=True)
+        
+        # Download CSV
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download CSV Results",
+            csv,
+            "ebay_listings.csv",
+            "text/csv"
+        )
