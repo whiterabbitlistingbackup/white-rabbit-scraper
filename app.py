@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import io
-import zipfile
 from urllib.parse import urlparse
+import time
 
 st.title("🐇 White Rabbit Scraper")
 st.write("Paste your eBay listing URLs below. One per line.")
@@ -23,7 +22,12 @@ def scrape_images(urls):
     results = []
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
     }
     
     progress_bar = st.progress(0)
@@ -35,30 +39,66 @@ def scrape_images(urls):
         status_text.text(f"Scraping {idx + 1}/{len(urls)}: {url}")
         
         try:
-            response = requests.get(url, headers=headers, timeout=15)
+            # Add small delay between requests
+            time.sleep(1)
+            
+            response = requests.get(
+                url, 
+                headers=headers, 
+                timeout=15,
+                allow_redirects=True
+            )
             response.raise_for_status()
             
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Find all images
-            img_tags = soup.find_all('img')
-            img_urls = []
+            # eBay stores images in multiple ways
+            img_urls = set()
             
-            for img in img_tags:
+            # Method 1: Direct img tags
+            for img in soup.find_all('img'):
                 src = img.get('src') or img.get('data-src')
-                if src:
-                    # Convert relative URLs to absolute
-                    if src.startswith('/'):
-                        src = 'https://ebay.com' + src
-                    if src.startswith('http'):
-                        img_urls.append(src)
+                if src and ('ebayimg' in src or 's-l' in src or 'picsum' in src):
+                    img_urls.add(src)
+            
+            # Method 2: Picture tags with sources
+            for picture in soup.find_all('picture'):
+                for source in picture.find_all('source'):
+                    src = source.get('srcset')
+                    if src:
+                        img_urls.add(src.split()[0])
+            
+            # Method 3: Look for image URLs in script/JSON
+            for script in soup.find_all('script'):
+                if script.string and 'ebayimg' in script.string:
+                    import re
+                    urls_found = re.findall(r'https://[^\s"<>]+(?:jpg|jpeg|png|gif)', script.string)
+                    img_urls.update(urls_found)
+            
+            img_list = list(img_urls)
             
             results.append({
                 "Listing URL": url,
-                "Image Count": len(img_urls),
-                "Images": "\n".join(img_urls) if img_urls else "No images found",
-                "Status": "✅ Success" if img_urls else "⚠️ No images found"
+                "Image Count": len(img_list),
+                "Images": "\n".join(img_list) if img_list else "No images found",
+                "Status": "✅ Success" if img_list else "⚠️ No images"
             })
+            
+        except requests.HTTPError as e:
+            if e.response.status_code == 403:
+                results.append({
+                    "Listing URL": url,
+                    "Image Count": 0,
+                    "Images": "",
+                    "Status": "❌ 403 Forbidden - eBay blocked request"
+                })
+            else:
+                results.append({
+                    "Listing URL": url,
+                    "Image Count": 0,
+                    "Images": "",
+                    "Status": f"❌ HTTP {e.response.status_code}"
+                })
             
         except requests.Timeout:
             results.append({
@@ -73,7 +113,7 @@ def scrape_images(urls):
                 "Listing URL": url,
                 "Image Count": 0,
                 "Images": "",
-                "Status": f"❌ Error: {str(e)[:50]}"
+                "Status": f"❌ {str(e)[:40]}"
             })
     
     return results
