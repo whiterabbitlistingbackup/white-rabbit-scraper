@@ -2,9 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
-import os
 import io
-import zipfile
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
@@ -15,8 +13,9 @@ HEADERS = {
     "Cookie": "ebay=%5Esbf%3D%23000000%5E"
 }
 
+st.set_page_config(page_title="White Rabbit eBay Scraper", layout="wide")
 st.title("🐇 White Rabbit eBay Scraper")
-st.write("Extract full eBay listings with images, condition, price, and more.")
+st.write("Extract full eBay listings: images, condition, price, postage, category & more")
 
 # --- Helpers ---
 def clean_title(title):
@@ -60,6 +59,21 @@ def extract_price(soup):
             return tag.get_text(strip=True)
     return "UnknownPrice"
 
+def extract_postage(soup):
+    tag = soup.select_one(".x-shipping-cost")
+    if tag:
+        return tag.get_text(strip=True)
+    
+    tag = soup.select_one(".ux-labels-values__values-content")
+    if tag and ("£" in tag.get_text() or "Free" in tag.get_text()):
+        return tag.get_text(strip=True)
+    
+    tag = soup.find("span", {"id": "fshippingCost"})
+    if tag:
+        return tag.get_text(strip=True)
+    
+    return "UnknownPostage"
+
 def extract_category(soup):
     crumbs = soup.select("li.seo-breadcrumb-text")
     if crumbs:
@@ -79,10 +93,18 @@ def extract_category(soup):
         matches = re.findall(r'"categoryName":"([^"]+)"', text)
         for m in matches:
             category_candidates.append(m)
+        
+        matches = re.findall(r'"name":"([^"]+)"', text)
+        for m in matches:
+            if len(m) < 3 or m.isupper() or "_" in m or m.lower() in ["name", "jsonld", "search", "information"]:
+                continue
+            category_candidates.append(m)
     
     category_candidates = list(dict.fromkeys(category_candidates))
-    if category_candidates:
-        return category_candidates[0]
+    real = [c for c in category_candidates if c[0].isupper() and " " in c]
+    
+    if real:
+        return " > ".join(real[:5])
     
     return "UnknownCategory"
 
@@ -101,12 +123,51 @@ def extract_description(soup, html):
         except:
             pass
     
+    iframe = soup.find("iframe")
+    if iframe and iframe.get("src") and "ebaydesc" in iframe["src"]:
+        iframe_url = iframe["src"]
+        if iframe_url.startswith("//"):
+            iframe_url = "https:" + iframe_url
+        try:
+            r = requests.get(iframe_url, headers=HEADERS, timeout=10)
+            iframe_soup = BeautifulSoup(r.text, "html.parser")
+            text = iframe_soup.get_text("\n", strip=True)
+            if text:
+                return text
+        except:
+            pass
+    
     for pid in ["desc_div", "viTabs_0_is"]:
         tag = soup.find(id=pid)
         if tag:
             return tag.get_text("\n", strip=True)
     
     return "No seller description found."
+
+def extract_item_specifics(soup):
+    specifics = {}
+    
+    labels = soup.select(".ux-labels-values__labels")
+    values = soup.select(".ux-labels-values__values")
+    if labels and values:
+        for label, value in zip(labels, values):
+            specifics[label.get_text(strip=True)] = value.get_text(strip=True)
+    
+    table = soup.find("table", {"id": "vi-ia-attrTable"})
+    if table:
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                specifics[cells[0].get_text(strip=True).replace(":", "")] = cells[1].get_text(strip=True)
+    
+    fallback = soup.find("div", {"class": "itemAttr"})
+    if fallback:
+        for row in fallback.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                specifics[cells[0].get_text(strip=True).replace(":", "")] = cells[1].get_text(strip=True)
+    
+    return specifics
 
 def extract_gallery_images(soup):
     urls = set()
@@ -151,8 +212,10 @@ def scrape_listing(url):
     title = extract_title(soup)
     condition = extract_condition(soup)
     price = extract_price(soup)
+    postage = extract_postage(soup)
     category = extract_category(soup)
     description = extract_description(soup, html)
+    specifics = extract_item_specifics(soup)
     
     # Images
     img_urls = extract_gallery_images(soup)
@@ -167,58 +230,119 @@ def scrape_listing(url):
         "title": title,
         "condition": condition,
         "price": price,
+        "postage": postage,
         "category": category,
         "description": description,
+        "specifics": specifics,
         "images": img_urls,
         "image_count": len(img_urls)
     }, None
 
 # --- UI ---
-input_text = st.text_area("Paste eBay URLs (one per line):", height=150)
+input_text = st.text_area("Paste eBay URLs (one per line):", height=150, placeholder="https://www.ebay.co.uk/itm/...")
 
-if st.button("🔍 Scrape Listings", type="primary"):
+col1, col2 = st.columns([3, 1])
+with col2:
+    scrape_button = st.button("🔍 Scrape", type="primary", use_container_width=True)
+
+if scrape_button:
     urls = [u.strip() for u in input_text.split("\n") if u.strip().startswith("http")]
     
     if not urls:
-        st.error("No valid URLs provided")
+        st.error("❌ No valid URLs provided")
     else:
         progress_bar = st.progress(0)
         status = st.empty()
         
         results = []
+        details = {}
+        
         for idx, url in enumerate(urls):
             progress_bar.progress((idx + 1) / len(urls))
-            status.text(f"Scraping {idx + 1}/{len(urls)}...")
+            status.text(f"📍 Scraping {idx + 1}/{len(urls)}: {url[:60]}...")
             
             data, error = scrape_listing(url)
             if error:
                 results.append({
                     "URL": url,
-                    "Status": f"❌ {error}",
+                    "Status": "❌",
                     "Title": "",
                     "Condition": "",
                     "Price": "",
-                    "Images": 0
+                    "Postage": "",
+                    "Images": 0,
+                    "Error": error[:50]
                 })
             else:
                 results.append({
                     "URL": url,
-                    "Status": "✅ Success",
+                    "Status": "✅",
                     "Title": data["title"],
                     "Condition": data["condition"],
                     "Price": data["price"],
+                    "Postage": data["postage"],
                     "Images": data["image_count"]
                 })
+                details[url] = data
+        
+        progress_bar.empty()
+        status.empty()
         
         df = pd.DataFrame(results)
         st.success(f"✅ Scraped {len(urls)} listings!")
-        st.dataframe(df, use_container_width=True)
+        
+        # Summary stats
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total URLs", len(df))
+        with col2:
+            successful = len(df[df["Status"] == "✅"])
+            st.metric("✅ Successful", successful)
+        with col3:
+            failed = len(df[df["Status"] == "❌"])
+            st.metric("❌ Failed", failed)
+        with col4:
+            total_images = df[df["Status"] == "✅"]["Images"].sum()
+            st.metric("🖼️ Total Images", int(total_images))
+        
+        st.divider()
+        st.dataframe(df, use_container_width=True, hide_index=True)
         
         # Download CSV
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "📥 Download CSV Results",
+            "📥 Download CSV",
             csv,
             "ebay_listings.csv",
             "text/csv"
         )
+        
+        # Show details for successful scrapes
+        if details:
+            st.divider()
+            st.subheader("📋 Full Details")
+            
+            for url, data in details.items():
+                with st.expander(f"📄 {data['title']}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Condition:** {data['condition']}")
+                        st.write(f"**Price:** {data['price']}")
+                        st.write(f"**Postage:** {data['postage']}")
+                    with col2:
+                        st.write(f"**Category:** {data['category']}")
+                        st.write(f"**Images:** {data['image_count']}")
+                        st.write(f"**URL:** {url}")
+                    
+                    st.write("**Description:**")
+                    st.write(data['description'][:500] + "..." if len(data['description']) > 500 else data['description'])
+                    
+                    if data['specifics']:
+                        st.write("**Item Specifics:**")
+                        spec_df = pd.DataFrame(list(data['specifics'].items()), columns=["Key", "Value"])
+                        st.dataframe(spec_df, use_container_width=True, hide_index=True)
+                    
+                    if data['images']:
+                        st.write("**Image URLs:**")
+                        for i, img_url in enumerate(data['images'], 1):
+                            st.code(img_url, language="text")
