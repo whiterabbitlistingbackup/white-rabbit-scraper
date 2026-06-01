@@ -6,6 +6,8 @@ import tempfile
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
+import subprocess
+subprocess.run(["playwright", "install", "chromium"], check=False)
 
 # ────────────────────────────────────────────────────────────────
 #        ***       
