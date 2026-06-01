@@ -3,7 +3,6 @@ import pandas as pd
 import subprocess
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
-import re
 
 # --- Install Playwright browser on Streamlit Cloud (cached) ---
 @st.cache_resource
@@ -29,16 +28,7 @@ def scrape_images(urls):
     results = []
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer"
-            ]
-        )
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         
         # Create progress bar
@@ -52,8 +42,7 @@ def scrape_images(urls):
             status_text.text(f"Scraping {idx + 1}/{len(urls)}: {url}")
             
             try:
-                page.goto(url, timeout=60000)
-                page.wait_for_load_state("networkidle")
+                page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 
                 # Grab ALL images on the page
                 imgs = page.query_selector_all("img")
@@ -76,25 +65,27 @@ def scrape_images(urls):
                     "Listing URL": url,
                     "Image Count": 0,
                     "Images": [],
-                    "Status": "⏱️ Timeout (60s exceeded)",
+                    "Status": "⏱️ Timeout",
                     "Error": "Page load timeout"
                 })
                 
             except Exception as e:
                 error_msg = str(e)
-                if "net::ERR_NAME_NOT_RESOLVED" in error_msg:
+                if "crashed" in error_msg.lower():
+                    status = "❌ Browser crashed (page too heavy)"
+                elif "net::ERR_NAME_NOT_RESOLVED" in error_msg:
                     status = "❌ Invalid domain"
                 elif "net::ERR_CONNECTION" in error_msg:
                     status = "❌ Connection failed"
                 else:
-                    status = f"❌ Error: {error_msg[:50]}"
+                    status = "❌ Error"
                 
                 results.append({
                     "Listing URL": url,
                     "Image Count": 0,
                     "Images": [],
                     "Status": status,
-                    "Error": error_msg
+                    "Error": error_msg[:100]
                 })
         
         browser.close()
@@ -126,7 +117,7 @@ if st.button("Start Scraping", type="primary"):
             df = pd.DataFrame(data)
             st.success("✅ Scraping complete!")
             
-            # Display results with status column highlighted
+            # Display results
             st.dataframe(df, use_container_width=True)
             
             # Summary stats
